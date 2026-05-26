@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Project — synthetic + binary artifacts (large or regeneratable)
+test_data/
+*.pt
+*.pth
+*.onnx
+*.npy
+*.npz
+*.log
+
+# Training outputs / Kaggle artifacts (regeneratable, large)
+outputs_*/
+kagglerun/outputs_*/
+results*/
+
+# Jupyter
+.ipynb_checkpoints/
