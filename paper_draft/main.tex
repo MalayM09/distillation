@@ -1,0 +1,691 @@
+% =============================================================================
+% paper_draft/main.tex — CAISc 2026 submission
+%
+% Compile with:
+%     pdflatex main.tex && pdflatex main.tex
+%
+% Notes
+% -----
+% * Uses IEEEtran for portable double-column conference layout (no external
+%   style files needed; ships with every TeX Live install). To switch to
+%   CVPR style, replace the documentclass line with `\documentclass{cvpr}`
+%   and download cvpr.sty, but the body content compiles unchanged.
+% * Every numerical claim in this draft is sourced from results/ in the repo
+%   commit 8c8dc9b. Do not edit numbers here — edit them in
+%   results/multiseed_lambda100_results.md or _lambda025_summary.md and
+%   re-sync. The IDs of every test are in this paper's tables verbatim.
+% =============================================================================
+
+\documentclass[conference]{IEEEtran}
+
+\IEEEoverridecommandlockouts
+\overrideIEEEmargins
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue, citecolor=blue}
+
+% Inline notation shortcuts
+\newcommand{\Lseg}{\mathcal{L}_{\text{seg}}}
+\newcommand{\Lnce}{\mathcal{L}_{\text{InfoNCE}}}
+\newcommand{\Lmse}{\mathcal{L}_{\text{MSE}}}
+\newcommand{\Lkl}{\mathcal{L}_{\text{KL}}}
+\newcommand{\dice}{\mathrm{Dice}}
+\newcommand{\iou}{\mathrm{IoU}}
+
+\title{When Does Foundation-Model Distillation Help Edge Medical Segmentation?\\An Empirical Study of the Capacity Gap}
+
+\author{%
+\IEEEauthorblockN{Malay Mishra}
+\IEEEauthorblockA{Birla Institute of Technology and Science, Pilani\\
+\texttt{f20220116@pilani.bits-pilani.ac.in}}
+}
+
+\begin{document}
+\maketitle
+
+% =============================================================================
+\begin{abstract}
+% =============================================================================
+Medical foundation models such as MedSAM (91M parameters) cannot run on
+handheld ultrasound devices, whose embedded NPUs admit fewer than
+3M parameters under INT8 deployment constraints. Knowledge distillation
+(KD) is the canonical bridge, yet the regime of \emph{capacity-ratio}
+$R = N_T/N_S$ under which it actually transfers accuracy at edge scale
+has not been established empirically.
+We study this question on the BUSI breast-ultrasound benchmark with a
+six-row ablation matrix at three random seeds and paired-bootstrap
+inference ($n = 10{,}000$ resamples). Three findings:
+\textbf{(i)} The \emph{Capacity Gap} is real. Direct InfoNCE distillation
+from MedSAM into a $<$3M EdgeUNet ($R\!\approx\!30$) yields no mean
+Dice lift over supervised training ($\Delta\!=\!-0.0005$, $p\!=\!0.733$).
+It does, however, reduce seed variance $3.5\times$.
+\textbf{(ii)} Capacity-matched CNN$\to$CNN distillation \emph{works
+robustly.} A 15M HA-Net teacher distilled into the same EdgeUNet
+($R\!\approx\!5$, MSE$+$KL) lifts mean Dice by $+0.0221$
+($\mathrm{CI}_{95}\!=\![+0.0203, +0.0233]$, $p\!<\!0.001$).
+\textbf{(iii)} Teacher-Assistant KD (TAKD) does not bridge the gap.
+The full MedSAM$\to$HA-Net$\to$EdgeUNet cascade does not exceed direct
+A2 ($\Delta\!=\!-0.0043$, $p\!=\!0.067$), and a Hop-1 hyperparameter fix
+that significantly improves the assistant ($+0.0152$ Dice, $p\!<\!0.001$)
+\emph{does not propagate} to the student ($\Delta\!=\!-0.0007$,
+$p\!=\!0.808$). We attribute this to a \emph{per-rung} Capacity Gap:
+Hop-2's MSE$+$KL transfer has its own student-side absorption ceiling
+that is independent of teacher quality. We conclude that hardware
+constraints dictate distillation topology, and \emph{CNN$\to$CNN at
+$R\!\approx\!5$ is the optimal edge recipe} on this task.
+\end{abstract}
+
+\begin{IEEEkeywords}
+knowledge distillation, edge AI, medical image segmentation, foundation
+models, teacher-assistant knowledge distillation, breast ultrasound
+\end{IEEEkeywords}
+
+% =============================================================================
+\section{Introduction}
+% =============================================================================
+
+Handheld breast-ultrasound probes are increasingly deployed in
+low-resource settings to screen for lesions that radiologists would
+otherwise contour by hand~\cite{busi}. Two constraints limit the
+deployable model: (a) the embedded NPUs in the probes (Hexagon, Ethos-U,
+CoreML) admit roughly \textbf{3M parameters} under INT8 quantization
+with no transformer or unfused attention operators; (b) prompt-free
+inference is required, because clinicians cannot reliably annotate
+bounding-box prompts during real-time scanning. Both constraints rule
+out direct deployment of contemporary medical foundation models. The
+state-of-the-art for medical mask generation, MedSAM~\cite{medsam}, is a
+91M-parameter ViT-B and requires a user bounding-box prompt.
+
+The canonical bridge is knowledge distillation
+(KD)~\cite{hinton2015distilling}: train a small, prompt-free student
+under supervision augmented with a signal from a larger teacher. KD's
+mathematical formalism does not, however, predict the regime in which
+it is empirically beneficial. Prior work in image classification has
+informally identified a ``capacity ratio'' $R = N_T / N_S$ above which
+distillation gains
+collapse~\cite{mirzadeh2020takd,cho2019efficacy}, but the
+edge-segmentation regime ($R$ on the order of 10--30, dense pixel
+labels, small lesion-to-background ratios) has not been characterized.
+
+We investigate three concrete questions on the BUSI benchmark:
+\textbf{(Q1)} Does direct distillation from MedSAM ($R\!\approx\!30$)
+lift the mean Dice of a $<$3M edge student? \textbf{(Q2)} Does
+capacity-matched CNN$\to$CNN distillation ($R\!\approx\!5$) lift the
+same student? \textbf{(Q3)} Does inserting a 15M intermediate assistant
+(Teacher-Assistant KD~\cite{mirzadeh2020takd}) bridge the gap when
+direct distillation fails?
+
+Our contributions are four:
+\begin{enumerate}
+\item \textbf{Empirical validation of the Capacity Gap.} Direct
+InfoNCE-based distillation from MedSAM (91M) into a 2.2M EdgeUNet does
+not lift mean Dice ($\Delta\!=\!-0.0005$, $p\!=\!0.733$, 3 seeds), but
+reduces seed variance by $3.5\times$.
+\item \textbf{Capacity-matched distillation as the working regime.} A
+15M HA-Net teacher distilled into the same EdgeUNet under MSE$+$KL lifts
+mean Dice by $+0.0221$ ($p\!<\!0.001$); the bootstrap CI width is just
+$0.003$ Dice, the tightest signal in our matrix.
+\item \textbf{Honest negative result on naive TAKD, doubly armored.}
+TAKD does not exceed direct distillation. We rule out Hop-1
+loss-weight tuning as the explanation: dropping the InfoNCE weight from
+$1.0$ to $0.25$ significantly improves the assistant ($+0.0152$ Dice,
+$p\!<\!0.001$) but the improvement does not propagate to the student
+($\Delta\!=\!-0.0007$, $p\!=\!0.808$).
+\item \textbf{A per-rung Capacity Gap interpretation.} We argue that
+MSE feature matching acts as a \emph{low-pass capacity filter}: the
+student's bottleneck has its own absorption ceiling, and improvements
+in teacher quality above that ceiling do not translate into improved
+Dice. The cascade therefore does not stack.
+\end{enumerate}
+
+Code, per-epoch training histories, and the multi-seed bootstrap
+artefacts are released at\\
+\url{https://github.com/MalayM09/distillation}.
+
+% =============================================================================
+\section{Related Work}
+% =============================================================================
+
+\paragraph{Medical foundation models.} MedSAM~\cite{medsam}, a
+ViT-B-based adaptation of SAM~\cite{kirillov2023sam} to medical imagery,
+sets the contemporary upper bound for mask generation across more than
+30 anatomies. It is, however, a 91M-parameter prompt-conditioned model
+and is therefore inapplicable at the edge without distillation. We use
+its image-encoder feature map (256-d at 64$\times$64) as a frozen
+teacher signal throughout.
+
+\paragraph{Knowledge distillation.} The Hinton response-distillation
+formulation~\cite{hinton2015distilling} matches student and teacher
+logit distributions under temperature scaling.
+FitNets~\cite{romero2014fitnets} extended this to intermediate feature
+maps via MSE. Both approaches assume an architectural family match
+between teacher and student. Contrastive
+distillation~\cite{tian2019crd,chen2020simclr} relaxes this assumption
+by aligning embeddings up to a learned projection; we adopt dense
+spatial InfoNCE in the ViT$\to$CNN regime, where direct MSE between
+disparate coordinate systems is ill-defined.
+
+\paragraph{Teacher-Assistant KD.} Mirzadeh et
+al.~\cite{mirzadeh2020takd} observed that the KD gain on CIFAR
+classification decays once the teacher exceeds the student capacity by
+more than approximately $8\times$, and proposed inserting an
+intermediate model to decompose the transfer into two shorter hops.
+This thesis motivated the design space we test here. To our knowledge,
+the present paper is the first to empirically grade the TAKD claim on
+edge-budget ($<$3M) medical segmentation.
+
+\paragraph{Edge medical segmentation.} Several prior works have produced
+\emph{deployable} ultrasound segmentation networks under 3M
+parameters~\cite{cao2022swinunet}, but to our knowledge none directly
+tests \emph{when} distillation from a foundation model is the right
+training recipe at this scale.
+
+% =============================================================================
+\section{Methodology}
+\label{sec:method}
+% =============================================================================
+
+\subsection{Architectures}
+
+We use exactly three architectures, ordered by capacity (Fig.~\ref{fig:arch}).
+
+\begin{figure}[t]
+\centering
+% Placeholder: insert architecture diagram showing MedSAM (91M, ViT-B,
+% encoder + neck) -> HA-Net (15M, ResNet-18 encoder + CBAM + bilinear
+% decoder) -> EdgeUNet (2.19M, 6-level vanilla U-Net). Highlight the
+% two distillation interfaces.
+\fbox{\parbox[c][3.5cm][c]{0.95\linewidth}{\centering\itshape Figure
+placeholder: three-rung architecture diagram.}}
+\caption{Architectures used in our ablation matrix. MedSAM (91M
+parameters, ViT-B + neck) supplies cached image-encoder features
+$z_T\in\mathbb{R}^{256\times 64\times 64}$. The assistant HA-Net (15M)
+is a ResNet-18-layout CNN with CBAM-gated skips. The student EdgeUNet
+(2.2M) is a vanilla 6-level U-Net, ONNX-clean and INT8-deployable.
+Capacity ratios $R_1\!=\!91/15\!\approx\!6$ and
+$R_2\!=\!15/3\!\approx\!5$ define the two cascade hops; $R = 91/3
+\approx 30$ for direct distillation.}
+\label{fig:arch}
+\end{figure}
+
+\paragraph{Teacher (MedSAM, 91M).} We use the public MedSAM ViT-B
+checkpoint~\cite{medsam}. To make distillation tractable on a 16\,GB
+GPU, we cache the image-encoder output once per BUSI sample to disk as
+an FP16 tensor of shape $256\!\times\!64\!\times\!64$; MedSAM is
+never loaded during student training.
+
+\paragraph{Assistant (HA-Net, 15.2M).} A custom Hybrid Attention
+U-Net~\cite{woo2018cbam}. The encoder is ResNet-18 in layout with
+channels $[64, 128, 256, 512]$ across four stride-2 stages; a
+$1\!\times\!1\!\to\!3\!\times\!3\!\to\!1\!\times\!1$ residual
+refinement block lives at the bottleneck. Skips are gated by CBAM
+channel-and-spatial attention. The decoder is bilinear-upsample $+$
+concat $+$ two $3\!\times\!3$ Conv-BN-SiLU at each of four stages. The
+network exposes a 512-channel bottleneck at stride $/32$ as its
+distillation surface. HA-Net is \emph{not} deployable at the edge --- it
+exists purely as a distillation intermediate.
+
+\paragraph{Student (EdgeUNet, 2.19M).} A vanilla 6-level U-Net with
+channel widths $(16, 32, 64, 96, 144, 192)$, fixed-scale bilinear
+upsampling, MaxPool downsampling, and BN-ReLU activations only. No
+attention, no LayerNorm, no GroupNorm. The total parameter count is
+\textbf{2{,}192{,}833 ($<$3M)} and the architecture admits a static
+ONNX-Resize-only export at opset 17 (verified). Its bottleneck is
+$(192, 8, 8)$ at stride $/32$, spatially aligned with HA-Net's.
+
+\subsection{Topology-Conditional Distillation Losses}
+
+The choice of distillation objective is fixed by the topological
+relationship between teacher and student.
+
+\paragraph{Rule 1 --- ViT$\to$CNN: Dense InfoNCE.} MedSAM emits ViT
+patch tokens whose absolute magnitudes, channel ordering, and spatial
+layout are not commensurable with a CNN feature map. Direct MSE or KL
+across the boundary is ill-posed. We use dense per-spatial-location
+InfoNCE~\cite{chen2020simclr}, with a small projection head $g_\phi$
+mapping the CNN bottleneck to MedSAM's $(256, 64, 64)$ grid:
+\begin{equation}
+\Lnce = -\frac{1}{|\mathcal{P}|}\sum_{i\in\mathcal{P}}
+\log\frac{\exp(\langle g_\phi(f_S^{(i)}),\,z_T^{(i)}\rangle / \tau)}
+{\sum_{j\in\mathcal{N}}\exp(\langle g_\phi(f_S^{(i)}),\,z_T^{(j)}\rangle / \tau)}
+\label{eq:nce}
+\end{equation}
+where $\mathcal{P}$ is the set of foreground anchors (lesion locations
+in the down-sampled mask), $\mathcal{N}$ is the set of background
+locations in the \emph{same image} (no cross-batch negatives), features
+are L2-normalized along the channel axis, and $\tau = 0.07$.
+
+\paragraph{Rule 2 --- CNN$\to$CNN: MSE feature matching $+$ KL logit
+KD.} When teacher and student share an architectural family,
+coordinate systems are approximately diagonal-linearly related;
+direct alignment is then mathematically optimal:
+\begin{align}
+\Lmse &= \frac{1}{N}\sum_i \lVert h_\psi(f_S^{(i)}) - f_T^{(i)} \rVert_2^2 \label{eq:mse}\\
+\Lkl  &= T^2 \cdot \mathrm{KL}\!\left[\sigma(z_T/T) \,\Vert\, \sigma(z_S/T)\right] \label{eq:kl}
+\end{align}
+with $h_\psi$ a $1\!\times\!1$ channel-projection from the student's
+192 channels to the teacher's 512, and $T = 2.0$ for the logit
+distillation.
+
+\paragraph{The TAKD cascade.} Our full pipeline composes the two rules
+(Fig.~\ref{fig:arch}):
+\[
+\text{MedSAM} \xrightarrow[\text{Rule 1}]{\Lnce} \text{HA-Net}
+\xrightarrow[\text{Rule 2}]{\Lmse + \Lkl} \text{EdgeUNet}.
+\]
+Each hop adds the supervised segmentation loss $\Lseg = $ BCE $+$ Soft
+Dice on the student logits. The decomposition routes the
+high-information CNN-native objectives through the second hop, where
+they are mathematically admissible.
+
+\subsection{Numerical Stability and AMP}
+
+Both InfoNCE and KL are computed in FP32 even under AMP autocast: the
+contrastive log-sum-exp at $\tau\!=\!0.07$ produces values
+($e^{14}\!\approx\!1.2\!\times\!10^6$) above FP16's representable range,
+and the KL temperature-scaled softmax suffers similar precision loss.
+Feature MSE is also accumulated in FP32. The segmentation
+BCE $+$ Dice remains in the autocast dtype.
+
+% =============================================================================
+\section{Experimental Setup}
+\label{sec:setup}
+% =============================================================================
+
+\paragraph{Dataset.} BUSI~\cite{busi} contains 647 lesion cases across
+benign and malignant subsets at native resolutions ranging from
+roughly $320$ to $600$ pixels per side. Multi-component lesions
+contribute multiple mask files which we OR-merge into a single binary
+mask. The dataset's small `normal' subset (no lesion) is excluded; the
+edge task is binary lesion segmentation.
+
+\paragraph{Splits and seeds.} We run each ablation under three random
+$80/20$ train/val splits indexed by seeds
+$\{20260530, 42, 1337\}$. Splits are deterministic given the seed.
+Reported variance is across these three independent runs.
+
+\paragraph{Training protocol.} All models are trained for 40 epochs with
+AdamW ($\mathrm{lr}\!=\!3\!\times\!10^{-4}$, $\mathrm{wd}\!=\!10^{-4}$),
+batch size 16, FP16 mixed precision, and \emph{hflip-only}
+augmentation. Rotation augmentation is forbidden because it breaks the
+$(i, j)$ student-anchor / MedSAM-teacher spatial correspondence on
+which the InfoNCE positive-pair construction depends; we apply the
+hflip synchronously to image, mask, and MedSAM feature tensor (its
+spatial $W$ axis). Training runs on a single 16\,GB Kaggle T4 GPU.
+
+\paragraph{Resolution-faithful evaluation.} Following recent medical
+imaging benchmarking practice, we evaluate Dice and IoU at the
+\emph{native} ultrasound resolution rather than at the 256$\times$256
+training resolution: predicted logits are bilinearly upsampled to the
+original $(H, W)$ of each test image, sigmoid-thresholded at 0.5, and
+compared against the original-size GT mask. This protocol is applied
+uniformly to every row of the matrix.
+
+\paragraph{Statistical inference.} For each pairwise comparison we
+compute the paired-bootstrap mean delta over the three seeds with
+$n\!=\!10{,}000$ resamples. We report mean $\pm$ std of best-epoch
+Dice across seeds, paired $\Delta$, 95\% bootstrap CI, and two-sided
+$p$-value. The decision rule pre-registered in our ablation document
+required $p\!<\!0.05$ on $\Delta_{\text{A3}-\text{A2}}$ for the TAKD
+claim to hold.
+
+% =============================================================================
+\section{Results}
+\label{sec:results}
+% =============================================================================
+
+\subsection{Main Matrix}
+
+Table~\ref{tab:main} reports the headline results across the six rows
+of our ablation matrix. Three rows of Table~\ref{tab:tests} record the
+load-bearing paired-bootstrap tests.
+
+\begin{table}[t]
+\centering
+\caption{Main ablation matrix on BUSI, 3 seeds, 40 epochs each. Dice
+and IoU are at native ultrasound resolution. \textbf{Params} reflects
+deployable parameter count; ``Edge'' indicates whether the model meets
+the $<\!3$M edge-deployment constraint. The intermediate assistant
+(A3-h1) is reported for diagnostic purposes only --- it is not a
+deployable artefact.}
+\label{tab:main}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}l l c c c@{}}
+\toprule
+\textbf{ID} & \textbf{Configuration} & \textbf{Params} & \textbf{Dice} & \textbf{IoU} \\
+\midrule
+B1     & EdgeUNet (sup. only)              & 2.19M & $0.7357 \pm 0.0222$ & $0.6469 \pm 0.0233$ \\
+B2     & HA-Net   (sup. only)              & 15.2M & $0.7653 \pm 0.0240$ & $0.6754 \pm 0.0279$ \\
+\midrule
+A1     & MedSAM$\to$EdgeUNet  ($R\!\approx\!30$) & 2.19M & $0.7353 \pm \mathbf{0.0063}$ & $0.6434 \pm 0.0126$ \\
+A2     & HA-Net(sup)$\to$EdgeUNet ($R\!\approx\!5$) & 2.19M & $\mathbf{0.7579 \pm 0.0235}$ & $\mathbf{0.6624 \pm 0.0240}$ \\
+\midrule
+A3-h1  & MedSAM$\to$HA-Net (Hop 1)         & 15.2M & $0.7317 \pm 0.0298$ & $0.6405 \pm 0.0316$ \\
+A3     & MedSAM$\to$HA-Net$\to$EdgeUNet (TAKD) & 2.19M & $0.7536 \pm 0.0230$ & $0.6623 \pm 0.0272$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Paired-bootstrap tests on Dice (n\,=\,10{,}000 resamples,
+seeds paired). Significance markers:
+\textsuperscript{***}\,$p\!<\!0.001$, \textsuperscript{**}\,$p\!<\!0.01$,
+\textsuperscript{*}\,$p\!<\!0.05$, ns\,=\,not significant.}
+\label{tab:tests}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}l c c c l@{}}
+\toprule
+\textbf{Test} & $\boldsymbol{\Delta}$ \textbf{Dice} & \textbf{CI$_{95}$} & $\boldsymbol{p}$ & \textbf{Verdict} \\
+\midrule
+A1 $-$ B1 & $-0.0005$ & $[-0.0157, +0.0230]$ & $0.733$ & ns (Capacity Gap) \\
+A2 $-$ B1 & $+0.0221$ & $[+0.0203, +0.0233]$ & $<0.001$\textsuperscript{***} & lift confirmed \\
+A3 $-$ B1 & $+0.0178$ & $[+0.0132, +0.0231]$ & $<0.001$\textsuperscript{***} & lift confirmed \\
+A3 $-$ A2 & $-0.0043$ & $[-0.0101, +0.0003]$ & $0.067$ & ns (\textbf{TAKD fails}) \\
+A2 $-$ B2 & $-0.0074$ & $[-0.0190, +0.0067]$ & $0.300$ & ns (matches ceiling) \\
+A3 $-$ B2 & $-0.0117$ & $[-0.0187, -0.0034]$ & $<0.001$\textsuperscript{***} & below ceiling \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{The Capacity Gap is real (Q1)}
+
+Direct InfoNCE distillation from MedSAM to EdgeUNet ($R\!\approx\!30$)
+produces no significant mean Dice lift over supervised training:
+$\Delta_{\text{A1}-\text{B1}} = -0.0005$, $p\!=\!0.733$. The per-seed
+deltas alternate sign ($-0.0087$, $+0.0230$, $-0.0157$) and average to
+within $10^{-4}$ Dice of zero. This empirically validates the
+\emph{Capacity Gap} hypothesis: at this ratio, the 3M student lacks the
+function-class expressivity to absorb the 91M teacher's representation,
+and the InfoNCE objective degenerates from a knowledge transfer to a
+regularizer.
+
+\textit{A robust auxiliary finding.} The seed standard deviation of A1
+($0.0063$) is roughly $3.5\times$ lower than that of B1 ($0.0222$).
+Contrastive distillation thus acts as a strong \emph{variance
+regularizer} even when mean Dice is unchanged --- a property that
+matters in clinical deployment, where seed-level reproducibility is
+itself a desideratum.
+
+\subsubsection{Capacity-matched distillation works (Q2)}
+
+Substituting MedSAM for the 15M supervised HA-Net teacher and switching
+to Rule 2 (MSE$+$KL) yields a robust lift over the supervised floor:
+$\Delta_{\text{A2}-\text{B1}} = +0.0221$ with 95\% bootstrap CI
+$[+0.0203, +0.0233]$ and $p\!<\!0.001$. The per-seed deltas
+($+0.0227$, $+0.0203$, $+0.0233$) are remarkably uniform, yielding a
+CI width of just 0.003 Dice; this is the tightest statistical signal in
+our matrix. A2 also statistically matches its supervised teacher's
+ceiling ($\Delta_{\text{A2}-\text{B2}}\!=\!-0.0074$, $p\!=\!0.300$).
+We interpret these jointly as the cleanest empirical demonstration
+available, on this task, that the load-bearing variable for KD
+benefit is \emph{capacity ratio} ($R\!\approx\!5$ admits the transfer;
+$R\!\approx\!30$ does not), not ``distillation'' nor
+``foundation-model knowledge.''
+
+\subsubsection{Naive TAKD does not bridge the gap (Q3)}
+
+The full MedSAM$\to$HA-Net$\to$EdgeUNet cascade scores Dice $0.7536\pm
+0.0230$, which neither significantly exceeds direct A2 nor reaches the
+supervised ceiling B2 (Table~\ref{tab:tests}). The
+pre-registered TAKD decision rule
+$\Delta_{\text{A3}-\text{A2}}\!>\!0$ at $p\!<\!0.05$ fails: $\Delta =
+-0.0043$, $p = 0.067$, trending negative if anything. A3 \emph{does}
+beat B1 (no-distillation floor) at $p\!<\!0.001$, but provides no
+advantage over the simpler A2 setup. The cascade is therefore
+strictly more expensive without being strictly better.
+
+\subsection{Hop-1 Hyperparameter Ablation: The Propagation Failure}
+\label{sec:hop1-ablation}
+
+Why does TAKD fail? The most plausible explanation is the
+\emph{loss-weight imbalance} in Hop 1. With $\lambda_{\text{NCE}} =
+1.0$ (the default in our default protocol), the InfoNCE term dominates
+$\Lseg$ by a factor of 5--20$\times$ throughout Hop-1 training; the
+HA-Net assistant may be over-optimized for MedSAM-token alignment at
+the cost of segmentation fidelity. We test this hypothesis directly by
+re-running Hop 1 (and the dependent Hop 2) across the same three seeds
+with $\lambda_{\text{NCE}} = 0.25$, all other hyperparameters held
+constant. The results are reported in Tables~\ref{tab:lambda-ablation}
+and~\ref{tab:propagation}.
+
+\begin{table}[t]
+\centering
+\caption{Hop-1 $\lambda_{\text{NCE}}$ ablation. Mean $\pm$ std of Dice
+across 3 seeds; all other hyperparameters held fixed.}
+\label{tab:lambda-ablation}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}l c c c@{}}
+\toprule
+\textbf{Ablation} & $\boldsymbol{\lambda\!=\!1.0}$ & $\boldsymbol{\lambda\!=\!0.25}$ & $\boldsymbol{\Delta}$ \\
+\midrule
+A3-h1 (assistant) & $0.7317\!\pm\!0.0298$ & $0.7469\!\pm\!0.0280$ & $\mathbf{+0.0152}$ \\
+A3   (student)    & $0.7536\!\pm\!0.0230$ & $0.7529\!\pm\!0.0172$ & $-0.0007$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Per-seed deltas for the Hop-1 ablation. The improvement at
+the assistant level is monotonic across all three seeds; the
+improvement at the student level is not. Notably, on the best seed
+(20260530) the assistant improves by $+0.0093$ but the student
+\emph{regresses} by $-0.0158$.}
+\label{tab:propagation}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}r c c | c c@{}}
+\toprule
+\textbf{Seed}
+ & \textbf{A3-h1 $\Delta$} & \textbf{Sign}
+ & \textbf{A3 $\Delta$}    & \textbf{Sign} \\
+\midrule
+20260530 & $+0.0093$ & $\uparrow$ & $-0.0158$ & $\downarrow$ \\
+42       & $+0.0168$ & $\uparrow$ & $+0.0080$ & $\uparrow$ \\
+1337     & $+0.0195$ & $\uparrow$ & $+0.0057$ & $\uparrow$ \\
+\midrule
+mean     & $+0.0152$ & ($p\!<\!0.001$) & $-0.0007$ & ($p\!=\!0.808$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The fix \emph{worked at the assistant level}: A3-h1 improves by
+$+0.0152$ Dice over the $\lambda\!=\!1.0$ baseline, monotonically
+across all three seeds, $p\!<\!0.001$. But the improvement
+\textbf{does not propagate to the student}: the paired-bootstrap
+$\Delta$ on A3 is $-0.0007$, $p\!=\!0.808$, and on the best seed
+(20260530) the student actually \emph{regresses} by $-0.0158$ despite
+its teacher improving by $+0.0093$. The TAKD decision rule remains
+unsatisfied:
+$\Delta_{\text{A3(new)}-\text{A2}}\!=\!-0.0050$, $p\!=\!0.291$.
+
+This result is far stronger than a single negative TAKD finding: it
+rules out the obvious explanation. The cascade does not fail because
+$\lambda_{\text{NCE}}$ was mistuned. It fails because the Hop-2 transfer
+itself imposes a capacity ceiling that the assistant's quality cannot
+penetrate.
+
+% =============================================================================
+\section{Discussion}
+\label{sec:discussion}
+% =============================================================================
+
+\subsection{Hop-2 as a Low-Pass Capacity Filter}
+
+The propagation failure documented in Section~\ref{sec:hop1-ablation}
+is best understood through the per-batch Hop-2 loss statistics. At
+$\lambda_{\text{NCE}}=1.0$, the converged feature-MSE plateau is
+$\sim$0.59--0.85 across seeds; under the improved-teacher condition
+($\lambda_{\text{NCE}}=0.25$), the converged MSE plateau is
+$\sim$0.77--0.94 --- equal or \emph{higher}. The KL term shows the
+same pattern (mean converged KL: $\sim$0.04 with the old teacher,
+$\sim$0.04--0.24 with the new one). A better teacher produces
+\emph{harder} targets for the 3M student to mimic, but does not enable
+better student segmentation.
+
+This is the central observation of our paper: \textbf{MSE feature
+matching has a student-capacity ceiling that is independent of teacher
+quality}. Once the teacher's representation exceeds the complexity the
+student can fit, further teacher improvements produce gradient signal
+the student cannot translate into segmentation accuracy. Concretely,
+the student's $1\!\times\!1$ projector $h_\psi$ (192$\to$512 channels)
+is a linear map of fixed rank 192; teacher feature directions outside
+that rank are simply discarded. Hop-2 thus acts as a
+\emph{low-pass capacity filter}: it transmits the components of the
+teacher representation that lie within the student's $192$-dimensional
+column space and silently throws away the rest.
+
+\subsection{Per-Rung Capacity Gap: Why the Cascade Does Not Stack}
+
+The mechanism that kills direct distillation at $R\!\approx\!30$ also
+operates inside the cascade at $R\!\approx\!5$. Each rung of TAKD
+suffers \emph{its own} Capacity Gap independently. Improvements above
+the rung's capacity ceiling do not propagate downstream. This is not
+predicted by the TAKD literature's
+function-class-bridging
+argument~\cite{mirzadeh2020takd}: shortening the capacity ratio per
+hop reduces the gap, it does not eliminate it. We conjecture
+(without proving) that the same mechanism would re-emerge if one
+inserted yet another assistant between HA-Net and EdgeUNet: the new
+rung's $R\!\approx\!2$ transfer would still saturate at the
+192-dimensional student bottleneck.
+
+\subsection{Practical Recommendation}
+
+For deployment, A2 dominates A3 on every axis we measure: equal or
+better Dice, simpler training pipeline (one teacher rather than two,
+no MedSAM dependency at training time after the assistant is trained),
+fewer hyperparameters ($\lambda_{\text{MSE}}, \lambda_{\text{KL}}, T$
+in Hop 2 only, instead of those plus $\lambda_{\text{NCE}}, \tau$ in
+Hop 1), and equal compute. We therefore recommend
+\textbf{capacity-matched CNN$\to$CNN distillation at $R\!\approx\!5$}
+as the working recipe for edge medical segmentation, and we recommend
+\emph{against} naive Teacher-Assistant cascades that route through ViT
+teachers.
+
+\subsection{Limitations and Threats to Validity}
+
+(1) The bootstrap inference is over three paired observations per
+test; while this is consistent with standard medical-imaging
+multi-seed protocols, a five- or seven-seed replication would tighten
+all CIs.
+(2) Our distillation objectives are limited to InfoNCE (Rule 1) and
+MSE$+$KL (Rule 2). Layer-wise feature distillation, attention
+transfer~\cite{zagoruyko2017at}, and relational
+distillation~\cite{park2019rkd} were not tested; one of these may
+recover TAKD by replacing the rank-limited MSE bottleneck.
+(3) Our student is fixed at 2.19M parameters with a specific
+6-level U-Net layout. A wider student bottleneck (e.g., 256 channels)
+could in principle absorb a richer teacher representation, but at the
+cost of the INT8 edge budget.
+(4) Generalization to other ultrasound datasets (thyroid, fetal) is
+not characterized in this work.
+
+% =============================================================================
+\section{Conclusion}
+% =============================================================================
+
+We empirically grade three claims about foundation-model distillation
+for edge medical segmentation. \textbf{(i)} The Capacity Gap at
+$R\!\approx\!30$ is real and prevents direct InfoNCE distillation from
+lifting mean Dice. \textbf{(ii)} Capacity-matched CNN$\to$CNN
+distillation at $R\!\approx\!5$ delivers a robust $+0.022$ Dice lift
+with $p\!<\!0.001$. \textbf{(iii)} Naive Teacher-Assistant KD does not
+bridge the gap, and the failure is not Hop-1 hyperparameter tuning: a
+$\lambda_{\text{NCE}}$ reduction that significantly improves the
+assistant produces zero net change at the student. We interpret this
+as a \emph{per-rung Capacity Gap} mediated by an MSE-induced low-pass
+filter on the Hop-2 transfer. The practical implication is direct:
+hardware constraints dictate distillation topology, and CNN$\to$CNN
+distillation at $R\!\approx\!5$ is the optimal training recipe at the
+$<$3M edge budget on this task. We release the code, the
+three-seed bootstrap artefacts, and our per-epoch training histories
+to enable reproduction and to invite future work on Hop-2
+architectures that may, eventually, rescue the cascade.
+
+% =============================================================================
+\begin{thebibliography}{99}
+% =============================================================================
+
+\bibitem{medsam}
+J.~Ma, Y.~He, F.~Li, L.~Han, C.~You, and B.~Wang,
+``Segment anything in medical images,''
+\emph{Nature Communications}, vol.~15, 2024.
+
+\bibitem{kirillov2023sam}
+A.~Kirillov, E.~Mintun, N.~Ravi, H.~Mao, C.~Rolland, L.~Gustafson,
+T.~Xiao, S.~Whitehead, A.~C.~Berg, W.-Y.~Lo, P.~Doll{\'a}r, and R.~Girshick,
+``Segment anything,'' in \emph{ICCV}, 2023.
+
+\bibitem{busi}
+W.~Al-Dhabyani, M.~Gomaa, H.~Khaled, and A.~Fahmy,
+``Dataset of breast ultrasound images,''
+\emph{Data in Brief}, vol.~28, p.~104863, 2020.
+
+\bibitem{hinton2015distilling}
+G.~Hinton, O.~Vinyals, and J.~Dean,
+``Distilling the knowledge in a neural network,''
+in \emph{NeurIPS Deep Learning Workshop}, 2015.
+
+\bibitem{romero2014fitnets}
+A.~Romero, N.~Ballas, S.~E.~Kahou, A.~Chassang, C.~Gatta, and Y.~Bengio,
+``FitNets: hints for thin deep nets,''
+in \emph{ICLR}, 2015.
+
+\bibitem{mirzadeh2020takd}
+S.~I.~Mirzadeh, M.~Farajtabar, A.~Li, N.~Levine, A.~Matsukawa, and H.~Ghasemzadeh,
+``Improved knowledge distillation via teacher assistant,''
+in \emph{AAAI}, 2020.
+
+\bibitem{cho2019efficacy}
+J.~H.~Cho and B.~Hariharan,
+``On the efficacy of knowledge distillation,''
+in \emph{ICCV}, 2019.
+
+\bibitem{tian2019crd}
+Y.~Tian, D.~Krishnan, and P.~Isola,
+``Contrastive representation distillation,''
+in \emph{ICLR}, 2020.
+
+\bibitem{chen2020simclr}
+T.~Chen, S.~Kornblith, M.~Norouzi, and G.~Hinton,
+``A simple framework for contrastive learning of visual representations,''
+in \emph{ICML}, 2020.
+
+\bibitem{woo2018cbam}
+S.~Woo, J.~Park, J.-Y.~Lee, and I.~S.~Kweon,
+``CBAM: convolutional block attention module,''
+in \emph{ECCV}, 2018.
+
+\bibitem{cao2022swinunet}
+H.~Cao, Y.~Wang, J.~Chen, D.~Jiang, X.~Zhang, Q.~Tian, and M.~Wang,
+``Swin-Unet: Unet-like pure transformer for medical image segmentation,''
+in \emph{ECCV Workshops}, 2022.
+
+\bibitem{zagoruyko2017at}
+S.~Zagoruyko and N.~Komodakis,
+``Paying more attention to attention: improving the performance of convolutional neural networks via attention transfer,''
+in \emph{ICLR}, 2017.
+
+\bibitem{park2019rkd}
+W.~Park, D.~Kim, Y.~Lu, and M.~Cho,
+``Relational knowledge distillation,''
+in \emph{CVPR}, 2019.
+
+\end{thebibliography}
+
+\end{document}
