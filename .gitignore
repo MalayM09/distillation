@@ -40,7 +40,9 @@ test_data/
 # Training outputs / Kaggle artifacts (regeneratable, large)
 outputs_*/
 kagglerun/outputs_*/
-results*/
+# Legacy Kaggle-download artifact (note the space + parenthesis); the new
+# 'results/' directory IS tracked — it contains the canonical paper results.
+results (*)*/
 
 # Jupyter
 .ipynb_checkpoints/
